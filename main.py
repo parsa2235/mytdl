@@ -3,9 +3,13 @@ import re
 import asyncio
 import subprocess
 
-# قابلیت ۱: فعال‌سازی موتور فوق‌سریع uvloop بر پایه C برای لینوکس
+# ۱. نصب موتور uvloop
 import uvloop
 uvloop.install()
+
+# ۲. ایجاد و معرفی Event Loop به پایتون قبل از import کردن Pyrogram (رفع دقیق خطای RuntimeError)
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 from pyrogram import Client
 
@@ -53,7 +57,7 @@ def progress(current, total):
         last_printed_percent = percent
         print(f"Downloading: {percent}% [{current}/{total} bytes]", flush=True)
 
-# 🚀 قابلیت ۳: سیستم دانلود موازی چندرشته‌ای (Multi-Worker Chunk Downloader)
+# 🚀 سیستم دانلود موازی چندرشته‌ای چانک‌ها (Multi-Worker Parallel Downloader)
 async def parallel_download_media(app, message, file_path, num_workers=10, progress_callback=None):
     file_obj = message.document or message.video or message.audio or message.photo
     if not file_obj:
@@ -61,14 +65,12 @@ async def parallel_download_media(app, message, file_path, num_workers=10, progr
         
     total_size = getattr(file_obj, "file_size", 0)
     
-    # برای فایل‌های کوچکتر از ۱۵ مگابایت، دانلود معمولی انجام می‌شود
     if not total_size or total_size < 15 * 1024 * 1024:
         return await app.download_media(message, file_name=file_path, progress=progress_callback)
 
-    chunk_size = 1024 * 1024  # چانک‌های ۱ مگابایتی
+    chunk_size = 1024 * 1024
     total_chunks = (total_size + chunk_size - 1) // chunk_size
 
-    # ایجاد فایل اولیه روی دیسک با حجم مشخص
     with open(file_path, "wb") as f:
         f.truncate(total_size)
 
@@ -106,7 +108,6 @@ async def parallel_download_media(app, message, file_path, num_workers=10, progr
                 if not success:
                     queue.put_nowait(chunk_idx)
 
-    # اجرای همزمان ورکرها (۱۰ دانلود موازی همزمان در شبکه)
     workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
     await asyncio.gather(*workers)
 
@@ -265,7 +266,6 @@ async def main():
                 print(f"⏳ در حال دانلود موازی با نام: {target_filename}", flush=True)
                 reset_progress()
                 
-                # فراخوانی دانلودر موازی چندرشته‌ای اختصاصی
                 downloaded_file = await parallel_download_media(app, message, download_path, num_workers=10, progress_callback=progress)
                 print(f"\n✅ دانلود موازی کامل شد: {downloaded_file}", flush=True)
 
@@ -287,4 +287,4 @@ async def main():
         print("✅ فایل download_links.txt به ریلیز گیتهاب اضافه شد!", flush=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop.run_until_complete(main())
