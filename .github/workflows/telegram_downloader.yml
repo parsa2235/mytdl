@@ -1,0 +1,54 @@
+name: Telegram File Downloader to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      links:
+        description: 'لینک‌ها را وارد کنید (هر خط یک لینک یا بازه‌ای مثل 10-15)'
+        required: true
+        type: string
+      release_tag:
+        description: 'نام ریلیز گیتهاب (اختیاری)'
+        required: false
+        default: 'telegram-downloads'
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space (آزادکننده فضای دیسک اکشن)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo docker image prune --all --force
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies & Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          pip install -r requirements.txt
+
+      - name: Run Telegram Downloader
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TG_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TG_API_HASH }}
+          TELEGRAM_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          LINKS_INPUT: ${{ inputs.links }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python main.py
