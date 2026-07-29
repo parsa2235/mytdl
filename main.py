@@ -2,9 +2,13 @@ import os
 import re
 import asyncio
 import subprocess
+
+# قابلیت ۱: فعال‌سازی موتور فوق‌سریع uvloop بر پایه C برای لینوکس
+import uvloop
+uvloop.install()
+
 from pyrogram import Client
 
-# تشخیص اکانت انتخابی از منوی گیتهاب
 ACCOUNT_CHOICE = os.getenv("ACCOUNT_CHOICE", "Account 1")
 
 if "2" in ACCOUNT_CHOICE:
@@ -29,11 +33,8 @@ LINKS_FILE = "download_links.txt"
 last_printed_percent = -1
 
 def sanitize_tag_and_title(raw_input):
-    """تبدیل فاصله‌ها به خط‌تیره جهت جلوگیری از ارور Tag گیتهاب"""
     title = raw_input.strip() if raw_input and raw_input.strip() else "telegram-downloads"
-    # تبدیل فاصله‌ها به خط‌تیره برای Tag
     tag = re.sub(r'\s+', '-', title)
-    # حذف کاراکترهای غیرمجاز در Tag
     tag = re.sub(r'[\x00-\x1F\x7F~^:?*\[\\\]@{}]+', '', tag)
     if not tag:
         tag = "telegram-downloads"
@@ -51,6 +52,65 @@ def progress(current, total):
     if percent % 5 == 0 and percent != last_printed_percent:
         last_printed_percent = percent
         print(f"Downloading: {percent}% [{current}/{total} bytes]", flush=True)
+
+# 🚀 قابلیت ۳: سیستم دانلود موازی چندرشته‌ای (Multi-Worker Chunk Downloader)
+async def parallel_download_media(app, message, file_path, num_workers=10, progress_callback=None):
+    file_obj = message.document or message.video or message.audio or message.photo
+    if not file_obj:
+        return None
+        
+    total_size = getattr(file_obj, "file_size", 0)
+    
+    # برای فایل‌های کوچکتر از ۱۵ مگابایت، دانلود معمولی انجام می‌شود
+    if not total_size or total_size < 15 * 1024 * 1024:
+        return await app.download_media(message, file_name=file_path, progress=progress_callback)
+
+    chunk_size = 1024 * 1024  # چانک‌های ۱ مگابایتی
+    total_chunks = (total_size + chunk_size - 1) // chunk_size
+
+    # ایجاد فایل اولیه روی دیسک با حجم مشخص
+    with open(file_path, "wb") as f:
+        f.truncate(total_size)
+
+    queue = asyncio.Queue()
+    for i in range(total_chunks):
+        queue.put_nowait(i)
+
+    downloaded_bytes = 0
+    lock = asyncio.Lock()
+
+    async def worker():
+        nonlocal downloaded_bytes
+        with open(file_path, "r+b") as f:
+            while not queue.empty():
+                try:
+                    chunk_idx = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                success = False
+                for _ in range(3):
+                    try:
+                        async for chunk in app.stream_media(message, offset=chunk_idx, limit=1):
+                            f.seek(chunk_idx * chunk_size)
+                            f.write(chunk)
+                            async with lock:
+                                downloaded_bytes += len(chunk)
+                                if progress_callback:
+                                    progress_callback(downloaded_bytes, total_size)
+                            success = True
+                            break
+                    except Exception:
+                        await asyncio.sleep(0.5)
+                
+                if not success:
+                    queue.put_nowait(chunk_idx)
+
+    # اجرای همزمان ورکرها (۱۰ دانلود موازی همزمان در شبکه)
+    workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+    await asyncio.gather(*workers)
+
+    return file_path
 
 def parse_target_links(raw_text):
     targets = []
@@ -151,7 +211,6 @@ def upload_to_github_release(files, tag_name, release_title):
         return
 
     print(f"\n🚀 در حال آپلود به ریلیز گیتهاب ({tag_name})...", flush=True)
-    # ساخت ریلیز با عنوان کامل فارسی
     subprocess.run(["gh", "release", "create", tag_name, "--title", release_title, "--notes", "Downloaded via Telegram Bot"], stderr=subprocess.DEVNULL)
     
     for file in files:
@@ -203,10 +262,12 @@ async def main():
                 target_filename = get_target_filename(message, custom_name)
                 download_path = os.path.join("downloads", target_filename)
 
-                print(f"⏳ در حال دانلود با نام: {target_filename}", flush=True)
+                print(f"⏳ در حال دانلود موازی با نام: {target_filename}", flush=True)
                 reset_progress()
-                downloaded_file = await app.download_media(message, file_name=download_path, progress=progress)
-                print(f"\n✅ دانلود کامل شد: {downloaded_file}", flush=True)
+                
+                # فراخوانی دانلودر موازی چندرشته‌ای اختصاصی
+                downloaded_file = await parallel_download_media(app, message, download_path, num_workers=10, progress_callback=progress)
+                print(f"\n✅ دانلود موازی کامل شد: {downloaded_file}", flush=True)
 
                 files_to_upload = split_file_if_needed(downloaded_file)
                 upload_to_github_release(files_to_upload, RELEASE_TAG, RELEASE_TITLE)
