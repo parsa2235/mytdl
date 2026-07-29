@@ -4,24 +4,48 @@ import asyncio
 import subprocess
 from pyrogram import Client
 
-# گرفتن متغیرهای محیطی
-API_ID = int(os.getenv("TELEGRAM_API_ID"))
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
+# تشخیص اکانت انتخابی از منوی گیتهاب
+ACCOUNT_CHOICE = os.getenv("ACCOUNT_CHOICE", "Account 1")
+
+if "2" in ACCOUNT_CHOICE:
+    API_ID = int(os.getenv("TG_API_ID_2") or 0)
+    API_HASH = os.getenv("TG_API_HASH_2")
+    SESSION_STRING = os.getenv("TG_SESSION_STRING_2")
+elif "3" in ACCOUNT_CHOICE:
+    API_ID = int(os.getenv("TG_API_ID_3") or 0)
+    API_HASH = os.getenv("TG_API_HASH_3")
+    SESSION_STRING = os.getenv("TG_SESSION_STRING_3")
+else:
+    API_ID = int(os.getenv("TG_API_ID_1") or os.getenv("TELEGRAM_API_ID") or 0)
+    API_HASH = os.getenv("TG_API_HASH_1") or os.getenv("TELEGRAM_API_HASH")
+    SESSION_STRING = os.getenv("TG_SESSION_STRING_1") or os.getenv("TELEGRAM_SESSION_STRING")
+
 LINKS_INPUT = os.getenv("LINKS_INPUT", "")
 CUSTOM_NAMES_INPUT = os.getenv("CUSTOM_NAMES_INPUT", "")
-RELEASE_TAG = os.getenv("RELEASE_TAG", "telegram-downloads")
+RAW_RELEASE_TAG = os.getenv("RELEASE_TAG", "telegram-downloads")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 
 LINKS_FILE = "download_links.txt"
 last_printed_percent = -1
+
+def sanitize_tag_and_title(raw_input):
+    """تبدیل فاصله‌ها به خط‌تیره جهت جلوگیری از ارور Tag گیتهاب"""
+    title = raw_input.strip() if raw_input and raw_input.strip() else "telegram-downloads"
+    # تبدیل فاصله‌ها به خط‌تیره برای Tag
+    tag = re.sub(r'\s+', '-', title)
+    # حذف کاراکترهای غیرمجاز در Tag
+    tag = re.sub(r'[\x00-\x1F\x7F~^:?*\[\\\]@{}]+', '', tag)
+    if not tag:
+        tag = "telegram-downloads"
+    return tag, title
+
+RELEASE_TAG, RELEASE_TITLE = sanitize_tag_and_title(RAW_RELEASE_TAG)
 
 def reset_progress():
     global last_printed_percent
     last_printed_percent = -1
 
 def progress(current, total):
-    """نمایش زنده درصد پیشرفت دانلود بدون بافر شدن"""
     global last_printed_percent
     percent = int((current / total) * 100)
     if percent % 5 == 0 and percent != last_printed_percent:
@@ -122,27 +146,31 @@ def split_file_if_needed(file_path, max_size_bytes=1900 * 1024 * 1024):
     parts.sort()
     return parts
 
-def upload_to_github_release(files, tag_name):
+def upload_to_github_release(files, tag_name, release_title):
     if not files:
         return
 
-    print("\n🚀 در حال آپلود به ریلیز گیتهاب...", flush=True)
-    subprocess.run(["gh", "release", "create", tag_name, "--title", f"Release {tag_name}", "--notes", "Downloaded via Telegram Bot"], stderr=subprocess.DEVNULL)
+    print(f"\n🚀 در حال آپلود به ریلیز گیتهاب ({tag_name})...", flush=True)
+    # ساخت ریلیز با عنوان کامل فارسی
+    subprocess.run(["gh", "release", "create", tag_name, "--title", release_title, "--notes", "Downloaded via Telegram Bot"], stderr=subprocess.DEVNULL)
     
     for file in files:
         basename = os.path.basename(file)
         print(f"Uploading {basename} ...", flush=True)
         cmd = ["gh", "release", "upload", tag_name, file, "--clobber"]
-        subprocess.run(cmd, check=True)
+        res = subprocess.run(cmd)
         
-        if GITHUB_REPOSITORY:
-            direct_url = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag_name}/{basename}"
-            with open(LINKS_FILE, "a", encoding="utf-8") as f:
-                f.write(direct_url + "\n")
-        
-        if os.path.exists(file):
-            os.remove(file)
-            print(f"✅ {basename} آپلود و از دیسک پاک شد.", flush=True)
+        if res.returncode == 0:
+            if GITHUB_REPOSITORY:
+                direct_url = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag_name}/{basename}"
+                with open(LINKS_FILE, "a", encoding="utf-8") as f:
+                    f.write(direct_url + "\n")
+            
+            if os.path.exists(file):
+                os.remove(file)
+                print(f"✅ {basename} آپلود و از دیسک پاک شد.", flush=True)
+        else:
+            print(f"❌ خطای آپلود برای {basename}", flush=True)
 
 async def main():
     if os.path.exists(LINKS_FILE):
@@ -155,11 +183,12 @@ async def main():
         print("❌ هیچ لینک معتبری یافت نشد!", flush=True)
         return
 
+    print(f"👤 اکانت فعال انتخاب‌شده: {ACCOUNT_CHOICE}", flush=True)
+    print(f"🏷️ نام ریلیز: {RELEASE_TITLE} (Tag: {RELEASE_TAG})", flush=True)
     print(f"🎯 تعداد کل پیام‌ها برای دانلود: {len(targets)}", flush=True)
 
     os.makedirs("downloads", exist_ok=True)
 
-    # بی اثر کردن آپدیت‌های پس‌زمینه با no_updates=True برای شروع آنی دانلود
     async with Client("my_bot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, no_updates=True, workers=32) as app:
         for idx, (chat_id, msg_id) in enumerate(targets):
             print(f"\n==========================================", flush=True)
@@ -180,7 +209,7 @@ async def main():
                 print(f"\n✅ دانلود کامل شد: {downloaded_file}", flush=True)
 
                 files_to_upload = split_file_if_needed(downloaded_file)
-                upload_to_github_release(files_to_upload, RELEASE_TAG)
+                upload_to_github_release(files_to_upload, RELEASE_TAG, RELEASE_TITLE)
 
             except Exception as e:
                 print(f"\n❌ خطایی در پردازش پیام {msg_id} رخ داد: {e}", flush=True)
