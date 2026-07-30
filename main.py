@@ -1,10 +1,10 @@
 import os
 import re
+import time
 import asyncio
 import subprocess
 from pyrogram import Client
 
-# تشخیص اکانت انتخابی از منوی گیتهاب
 ACCOUNT_CHOICE = os.getenv("ACCOUNT_CHOICE", "Account 1")
 
 if "2" in ACCOUNT_CHOICE:
@@ -26,6 +26,15 @@ RAW_RELEASE_TAG = os.getenv("RELEASE_TAG", "telegram-downloads")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 
 LINKS_FILE = "download_links.txt"
+
+# 📊 حافظه ردیابی سرجمع تمام فایل‌های همزمان
+task_downloaded = {}
+task_total_size = {}
+tracker_lock = asyncio.Lock()
+
+last_report_time = time.time()
+last_report_bytes = 0
+last_reported_percent = -1
 
 def sanitize_tag_and_title(raw_input):
     title = raw_input.strip() if raw_input and raw_input.strip() else "telegram-downloads"
@@ -138,7 +147,7 @@ async def upload_to_github_release_async(files, tag_name, release_title):
         return
 
     async with upload_lock:
-        print(f"\n🚀 در حال آپلود به ریلیز گیتهاب ({tag_name})...", flush=True)
+        print(f"\n🚀 شروع آپلود به ریلیز گیتهاب ({tag_name})...", flush=True)
         subprocess.run(["gh", "release", "create", tag_name, "--title", release_title, "--notes", "Downloaded via Pyrogram Bot"], stderr=subprocess.DEVNULL)
         
         for file in files:
@@ -155,14 +164,69 @@ async def upload_to_github_release_async(files, tag_name, release_title):
                 
                 if os.path.exists(file):
                     os.remove(file)
-                    print(f"✅ {basename} آپلود و از دیسک پاک شد.", flush=True)
+                    print(f"✅ آپلود تمام شد: {basename} (از دیسک پاک شد)", flush=True)
             else:
                 print(f"❌ خطای آپلود برای {basename}", flush=True)
 
-# 🚀 پردازشگر همزمان هر پیام (بدون محدودیت تعدادی)
+# 📊 گزارش‌گر سرجمع کل (سرعت کل، درصد کل و زمان باقی‌مانده کل)
+async def update_aggregate_progress(task_idx, current, total):
+    global last_report_time, last_report_bytes, last_reported_percent
+
+    async with tracker_lock:
+        task_downloaded[task_idx] = current
+        task_total_size[task_idx] = total
+
+        sum_downloaded = sum(task_downloaded.values())
+        sum_total = sum(task_total_size.values())
+
+        if sum_total == 0:
+            return
+
+        percent = int((sum_downloaded / sum_total) * 100)
+        now = time.time()
+        time_diff = now - last_report_time
+
+        # گزارش‌دهی کل سرجمع روی هر ۱۰٪ یا تغییر محسوس
+        if percent % 10 == 0 and percent != last_reported_percent and percent <= 100:
+            last_reported_percent = percent
+
+            speed_bytes_sec = 0
+            if time_diff > 0:
+                speed_bytes_sec = (sum_downloaded - last_report_bytes) / time_diff
+
+            speed_mb = speed_bytes_sec / (1024 * 1024)
+
+            eta_str = "..."
+            if speed_bytes_sec > 0:
+                remaining_bytes = sum_total - sum_downloaded
+                eta_sec = int(remaining_bytes / speed_bytes_sec)
+                m, s = divmod(eta_sec, 60)
+                h, m = divmod(m, 60)
+                if h > 0:
+                    eta_str = f"{h}h {m}m {s}s"
+                elif m > 0:
+                    eta_str = f"{m}m {s}s"
+                else:
+                    eta_str = f"{s}s"
+
+            last_report_time = now
+            last_report_bytes = sum_downloaded
+
+            curr_mb = sum_downloaded / (1024 * 1024)
+            total_mb = sum_total / (1024 * 1024)
+
+            completed_files = sum(1 for idx in task_downloaded if task_downloaded[idx] >= task_total_size[idx] and task_total_size[idx] > 0)
+            total_files_count = len(task_total_size)
+
+            print(
+                f"📊 [پیشرفت کل] {percent}% [{curr_mb:.1f}/{total_mb:.1f} MB] "
+                f"| سرعت کل: {speed_mb:.2f} MB/s "
+                f"| زمان باقی‌مانده: {eta_str} "
+                f"| ({completed_files}/{total_files_count} فایل)",
+                flush=True
+            )
+
 async def process_single_target(app, idx, total_count, chat_id, msg_id, custom_name):
-    print(f"\n==========================================", flush=True)
-    print(f"📥 [شروع دانلود موازی {idx + 1}/{total_count}]: Chat: {chat_id} | Message ID: {msg_id}", flush=True)
     try:
         message = await app.get_messages(chat_id, msg_id)
         if not message or not (message.document or message.video or message.audio or message.photo):
@@ -172,15 +236,17 @@ async def process_single_target(app, idx, total_count, chat_id, msg_id, custom_n
         target_filename = get_target_filename(message, custom_name)
         download_path = os.path.join("downloads", f"task_{idx}_{target_filename}")
 
-        downloaded_file = await app.download_media(message, file_name=download_path)
+        def progress_wrapper(current, total):
+            asyncio.create_task(update_aggregate_progress(idx, current, total))
 
-        # تغییر نام به نام اصلی در پوشه دانلودها
+        downloaded_file = await app.download_media(message, file_name=download_path, progress=progress_wrapper)
+
         final_path = os.path.join("downloads", target_filename)
         if os.path.exists(downloaded_file):
             os.rename(downloaded_file, final_path)
             downloaded_file = final_path
 
-        print(f"\n✅ دانلود کامل شد: {target_filename} ➔ شروع بلافاصله آپلود و پاکسازی...", flush=True)
+        print(f"\n✅ دانلود فایل کامل شد: {target_filename} ➔ شروع بلافاصله آپلود...", flush=True)
 
         files_to_upload = split_file_if_needed(downloaded_file)
         await upload_to_github_release_async(files_to_upload, RELEASE_TAG, RELEASE_TITLE)
@@ -212,7 +278,6 @@ async def main():
             task = asyncio.create_task(process_single_target(app, idx, len(targets), chat_id, msg_id, custom_name))
             tasks.append(task)
 
-        # ⚡ اجرای تمام فایل‌ها به صورت ۱۰۰٪ همزمان و بدون محدودیت
         await asyncio.gather(*tasks)
 
     if os.path.exists(LINKS_FILE) and os.path.getsize(LINKS_FILE) > 0:
