@@ -26,31 +26,16 @@ RAW_RELEASE_TAG = os.getenv("RELEASE_TAG", "telegram-downloads")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 
 LINKS_FILE = "download_links.txt"
-last_printed_percent = -1
 
 def sanitize_tag_and_title(raw_input):
-    """تبدیل فاصله‌ها به خط‌تیره جهت جلوگیری از ارور Tag گیتهاب"""
     title = raw_input.strip() if raw_input and raw_input.strip() else "telegram-downloads"
-    # تبدیل فاصله‌ها به خط‌تیره برای Tag
     tag = re.sub(r'\s+', '-', title)
-    # حذف کاراکترهای غیرمجاز در Tag
     tag = re.sub(r'[\x00-\x1F\x7F~^:?*\[\\\]@{}]+', '', tag)
     if not tag:
         tag = "telegram-downloads"
     return tag, title
 
 RELEASE_TAG, RELEASE_TITLE = sanitize_tag_and_title(RAW_RELEASE_TAG)
-
-def reset_progress():
-    global last_printed_percent
-    last_printed_percent = -1
-
-def progress(current, total):
-    global last_printed_percent
-    percent = int((current / total) * 100)
-    if percent % 5 == 0 and percent != last_printed_percent:
-        last_printed_percent = percent
-        print(f"Downloading: {percent}% [{current}/{total} bytes]", flush=True)
 
 def parse_target_links(raw_text):
     targets = []
@@ -146,31 +131,62 @@ def split_file_if_needed(file_path, max_size_bytes=1900 * 1024 * 1024):
     parts.sort()
     return parts
 
-def upload_to_github_release(files, tag_name, release_title):
+upload_lock = asyncio.Lock()
+
+async def upload_to_github_release_async(files, tag_name, release_title):
     if not files:
         return
 
-    print(f"\n🚀 در حال آپلود به ریلیز گیتهاب ({tag_name})...", flush=True)
-    # ساخت ریلیز با عنوان کامل فارسی
-    subprocess.run(["gh", "release", "create", tag_name, "--title", release_title, "--notes", "Downloaded via Telegram Bot"], stderr=subprocess.DEVNULL)
-    
-    for file in files:
-        basename = os.path.basename(file)
-        print(f"Uploading {basename} ...", flush=True)
-        cmd = ["gh", "release", "upload", tag_name, file, "--clobber"]
-        res = subprocess.run(cmd)
+    async with upload_lock:
+        print(f"\n🚀 در حال آپلود به ریلیز گیتهاب ({tag_name})...", flush=True)
+        subprocess.run(["gh", "release", "create", tag_name, "--title", release_title, "--notes", "Downloaded via Pyrogram Bot"], stderr=subprocess.DEVNULL)
         
-        if res.returncode == 0:
-            if GITHUB_REPOSITORY:
-                direct_url = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag_name}/{basename}"
-                with open(LINKS_FILE, "a", encoding="utf-8") as f:
-                    f.write(direct_url + "\n")
+        for file in files:
+            basename = os.path.basename(file)
+            print(f"Uploading {basename} ...", flush=True)
+            cmd = ["gh", "release", "upload", tag_name, file, "--clobber"]
+            res = subprocess.run(cmd)
             
-            if os.path.exists(file):
-                os.remove(file)
-                print(f"✅ {basename} آپلود و از دیسک پاک شد.", flush=True)
-        else:
-            print(f"❌ خطای آپلود برای {basename}", flush=True)
+            if res.returncode == 0:
+                if GITHUB_REPOSITORY:
+                    direct_url = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag_name}/{basename}"
+                    with open(LINKS_FILE, "a", encoding="utf-8") as f:
+                        f.write(direct_url + "\n")
+                
+                if os.path.exists(file):
+                    os.remove(file)
+                    print(f"✅ {basename} آپلود و از دیسک پاک شد.", flush=True)
+            else:
+                print(f"❌ خطای آپلود برای {basename}", flush=True)
+
+# 🚀 پردازشگر همزمان هر پیام (بدون محدودیت تعدادی)
+async def process_single_target(app, idx, total_count, chat_id, msg_id, custom_name):
+    print(f"\n==========================================", flush=True)
+    print(f"📥 [شروع دانلود موازی {idx + 1}/{total_count}]: Chat: {chat_id} | Message ID: {msg_id}", flush=True)
+    try:
+        message = await app.get_messages(chat_id, msg_id)
+        if not message or not (message.document or message.video or message.audio or message.photo):
+            print(f"⚠️ پیام {msg_id} حاوی فایل قابل دانلود نیست.", flush=True)
+            return
+
+        target_filename = get_target_filename(message, custom_name)
+        download_path = os.path.join("downloads", f"task_{idx}_{target_filename}")
+
+        downloaded_file = await app.download_media(message, file_name=download_path)
+
+        # تغییر نام به نام اصلی در پوشه دانلودها
+        final_path = os.path.join("downloads", target_filename)
+        if os.path.exists(downloaded_file):
+            os.rename(downloaded_file, final_path)
+            downloaded_file = final_path
+
+        print(f"\n✅ دانلود کامل شد: {target_filename} ➔ شروع بلافاصله آپلود و پاکسازی...", flush=True)
+
+        files_to_upload = split_file_if_needed(downloaded_file)
+        await upload_to_github_release_async(files_to_upload, RELEASE_TAG, RELEASE_TITLE)
+
+    except Exception as e:
+        print(f"\n❌ خطایی در پردازش پیام {msg_id} رخ داد: {e}", flush=True)
 
 async def main():
     if os.path.exists(LINKS_FILE):
@@ -185,34 +201,19 @@ async def main():
 
     print(f"👤 اکانت فعال انتخاب‌شده: {ACCOUNT_CHOICE}", flush=True)
     print(f"🏷️ نام ریلیز: {RELEASE_TITLE} (Tag: {RELEASE_TAG})", flush=True)
-    print(f"🎯 تعداد کل پیام‌ها برای دانلود: {len(targets)}", flush=True)
+    print(f"🎯 تعداد کل پیام‌ها برای دانلود همزمان و بدون محدودیت: {len(targets)}", flush=True)
 
     os.makedirs("downloads", exist_ok=True)
 
     async with Client("my_bot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, no_updates=True, workers=32) as app:
+        tasks = []
         for idx, (chat_id, msg_id) in enumerate(targets):
-            print(f"\n==========================================", flush=True)
-            print(f"📥 در حال پردازش {idx + 1} از {len(targets)}: Chat: {chat_id} | Message ID: {msg_id}", flush=True)
-            try:
-                message = await app.get_messages(chat_id, msg_id)
-                if not message or not (message.document or message.video or message.audio or message.photo):
-                    print("⚠️ این پیام حاوی فایل یا رسانه قابل دانلود نیست.", flush=True)
-                    continue
+            custom_name = custom_names[idx] if idx < len(custom_names) else None
+            task = asyncio.create_task(process_single_target(app, idx, len(targets), chat_id, msg_id, custom_name))
+            tasks.append(task)
 
-                custom_name = custom_names[idx] if idx < len(custom_names) else None
-                target_filename = get_target_filename(message, custom_name)
-                download_path = os.path.join("downloads", target_filename)
-
-                print(f"⏳ در حال دانلود با نام: {target_filename}", flush=True)
-                reset_progress()
-                downloaded_file = await app.download_media(message, file_name=download_path, progress=progress)
-                print(f"\n✅ دانلود کامل شد: {downloaded_file}", flush=True)
-
-                files_to_upload = split_file_if_needed(downloaded_file)
-                upload_to_github_release(files_to_upload, RELEASE_TAG, RELEASE_TITLE)
-
-            except Exception as e:
-                print(f"\n❌ خطایی در پردازش پیام {msg_id} رخ داد: {e}", flush=True)
+        # ⚡ اجرای تمام فایل‌ها به صورت ۱۰۰٪ همزمان و بدون محدودیت
+        await asyncio.gather(*tasks)
 
     if os.path.exists(LINKS_FILE) and os.path.getsize(LINKS_FILE) > 0:
         print("\n==========================================", flush=True)
