@@ -2,6 +2,7 @@ import os
 import re
 import time
 import asyncio
+import threading
 import subprocess
 from pyrogram import Client
 
@@ -27,10 +28,10 @@ GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 
 LINKS_FILE = "download_links.txt"
 
-# 📊 حافظه ردیابی سرجمع تمام فایل‌های همزمان
+# 📊 حافظه سنکرون ردیابی سرجمع تمام فایل‌های همزمان (Thread-Safe)
 task_downloaded = {}
 task_total_size = {}
-tracker_lock = asyncio.Lock()
+tracker_lock = threading.Lock()
 
 last_report_time = time.time()
 last_report_bytes = 0
@@ -168,11 +169,11 @@ async def upload_to_github_release_async(files, tag_name, release_title):
             else:
                 print(f"❌ خطای آپلود برای {basename}", flush=True)
 
-# 📊 گزارش‌گر سرجمع کل (سرعت کل، درصد کل و زمان باقی‌مانده کل)
-async def update_aggregate_progress(task_idx, current, total):
+# 📊 گزارش‌گر سنکرون سرجمع کل (Thread-Safe برای تردهای پایرگرام)
+def update_aggregate_progress(task_idx, current, total):
     global last_report_time, last_report_bytes, last_reported_percent
 
-    async with tracker_lock:
+    with tracker_lock:
         task_downloaded[task_idx] = current
         task_total_size[task_idx] = total
 
@@ -186,7 +187,6 @@ async def update_aggregate_progress(task_idx, current, total):
         now = time.time()
         time_diff = now - last_report_time
 
-        # گزارش‌دهی کل سرجمع روی هر ۱۰٪ یا تغییر محسوس
         if percent % 10 == 0 and percent != last_reported_percent and percent <= 100:
             last_reported_percent = percent
 
@@ -237,7 +237,7 @@ async def process_single_target(app, idx, total_count, chat_id, msg_id, custom_n
         download_path = os.path.join("downloads", f"task_{idx}_{target_filename}")
 
         def progress_wrapper(current, total):
-            asyncio.create_task(update_aggregate_progress(idx, current, total))
+            update_aggregate_progress(idx, current, total)
 
         downloaded_file = await app.download_media(message, file_name=download_path, progress=progress_wrapper)
 
