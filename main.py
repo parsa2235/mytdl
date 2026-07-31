@@ -169,7 +169,14 @@ async def upload_to_github_release_async(files, tag_name, release_title):
             else:
                 print(f"❌ خطای آپلود برای {basename}", flush=True)
 
-# 📊 گزارش‌گر سنکرون سرجمع کل (Thread-Safe برای تردهای پایرگرام)
+# ثبت اولیه حجم تمام فایل‌ها پیش از دانلود
+def register_task_size(task_idx, size):
+    with tracker_lock:
+        task_total_size[task_idx] = size
+        if task_idx not in task_downloaded:
+            task_downloaded[task_idx] = 0
+
+# 📊 گزارش‌گر سنکرون سرجمع کل
 def update_aggregate_progress(task_idx, current, total):
     global last_report_time, last_report_bytes, last_reported_percent
 
@@ -226,11 +233,10 @@ def update_aggregate_progress(task_idx, current, total):
                 flush=True
             )
 
-async def process_single_target(app, idx, total_count, chat_id, msg_id, custom_name):
+async def process_single_target(app, idx, total_count, message, custom_name):
     try:
-        message = await app.get_messages(chat_id, msg_id)
         if not message or not (message.document or message.video or message.audio or message.photo):
-            print(f"⚠️ پیام {msg_id} حاوی فایل قابل دانلود نیست.", flush=True)
+            print(f"⚠️ پیام شماره {idx + 1} حاوی فایل قابل دانلود نیست.", flush=True)
             return
 
         target_filename = get_target_filename(message, custom_name)
@@ -252,7 +258,7 @@ async def process_single_target(app, idx, total_count, chat_id, msg_id, custom_n
         await upload_to_github_release_async(files_to_upload, RELEASE_TAG, RELEASE_TITLE)
 
     except Exception as e:
-        print(f"\n❌ خطایی در پردازش پیام {msg_id} رخ داد: {e}", flush=True)
+        print(f"\n❌ خطایی در پردازش پیام شماره {idx + 1} رخ داد: {e}", flush=True)
 
 async def main():
     if os.path.exists(LINKS_FILE):
@@ -272,10 +278,27 @@ async def main():
     os.makedirs("downloads", exist_ok=True)
 
     async with Client("my_bot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, no_updates=True, workers=32) as app:
+        print("⏳ در حال استعلام اولیه تمام فایل‌ها جهت ثبت حجم کل...", flush=True)
+        
+        # استعلام یکجای پیام‌ها جهت ثبت حجم دقیق کل
+        messages = []
+        for chat_id, msg_id in targets:
+            try:
+                msg = await app.get_messages(chat_id, msg_id)
+                messages.append(msg)
+            except Exception:
+                messages.append(None)
+
+        for idx, msg in enumerate(messages):
+            if msg and (msg.document or msg.video or msg.audio or msg.photo):
+                file_obj = msg.document or msg.video or msg.audio or msg.photo
+                size = getattr(file_obj, "file_size", 0)
+                register_task_size(idx, size)
+
         tasks = []
-        for idx, (chat_id, msg_id) in enumerate(targets):
+        for idx, msg in enumerate(messages):
             custom_name = custom_names[idx] if idx < len(custom_names) else None
-            task = asyncio.create_task(process_single_target(app, idx, len(targets), chat_id, msg_id, custom_name))
+            task = asyncio.create_task(process_single_target(app, idx, len(targets), msg, custom_name))
             tasks.append(task)
 
         await asyncio.gather(*tasks)
